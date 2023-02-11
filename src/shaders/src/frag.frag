@@ -10,5 +10,5 @@ layout(binding = 0, set = 0) uniform sampler2D font_texture;
 void main() {
     // vec4 color = inColor * texture(font_texture, inUV);
     // if (color.a <= 0.1) discard;
-    outColor = texture(font_texture, inUV);
+    outColor = inColor;
 }

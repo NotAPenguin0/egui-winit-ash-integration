@@ -1,823 +1,195 @@
-use std::ffi::{CStr, CString};
-use std::mem::ManuallyDrop;
-use std::os::raw::c_char;
-#[cfg(debug_assertions)]
-use std::os::raw::c_void;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::{collections::HashSet, u64};
-use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
+#![warn(missing_docs)]
 
-use anyhow::Result;
-use ash::extensions::ext::DebugUtils;
-use ash::extensions::khr::{Surface, Swapchain};
-use ash::{vk, Device, Entry, Instance};
-use ash_window::{create_surface, enumerate_required_extensions};
-use cgmath::{Deg, Matrix4, Point3, Vector3};
-use crevice::std140::AsStd140;
-use egui_winit::winit::dpi::PhysicalSize;
-use egui_winit::winit::event::{Event, WindowEvent};
-use egui_winit::winit::event_loop::{EventLoop, ControlFlow};
-use egui_winit::winit::window::{Window, WindowBuilder};
-use gpu_allocator::vulkan::*;
-use memoffset::offset_of;
-#[cfg(debug_assertions)]
-use vk::DebugUtilsMessengerEXT;
+use ash::{extensions::khr::Swapchain, vk, Device};
+use bytemuck::bytes_of;
+use egui::{
+    epaint::{
+        ahash::AHashMap, ImageDelta
+    },
+    Context,
+    TexturesDelta,
+    TextureId
+};
+use egui_winit::{
+    winit::window::Window,
+    EventResponse
+};
+use winit::event_loop::EventLoop;
+use std::ffi::CString;
 
-#[cfg(debug_assertions)]
-const ENABLE_VALIDATION_LAYERS: bool = true;
-#[cfg(not(debug_assertions))]
-const ENABLE_VALIDATION_LAYERS: bool = false;
-const VALIDATION: &[&str] = &["VK_LAYER_KHRONOS_validation"];
+use crate::{*, utils::insert_image_memory_barrier};
 
-const DEVICE_EXTENSIONS: &[&str] = &["VK_KHR_swapchain"];
-
-const VERTEX_SHADER_PASS: &'static str = "examples/example/shaders/spv/vert.spv";
-const FRAGMENT_SHADER_PASS: &'static str = "examples/example/shaders/spv/frag.spv";
-
-const MODEL_PATH: &'static str = "examples/example/assets/monkey.obj";
-
-const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
-// convert vk string to String
-fn vk_to_string(raw_char_array: &[c_char]) -> String {
-    let raw_string = unsafe {
-        let pointer = raw_char_array.as_ptr();
-        CStr::from_ptr(pointer)
-    };
-    raw_string
-        .to_str()
-        .expect("Failed to convert vulkan raw string.")
-        .to_owned()
-}
-
-// Add perspective method
-trait Matrix4Ext {
-    fn perspective<A: Into<cgmath::Rad<f32>>>(
-        fovy: A,
-        aspecf32: f32,
-        near: f32,
-        far: f32,
-    ) -> Matrix4<f32>;
-}
-impl Matrix4Ext for Matrix4<f32> {
-    fn perspective<A: Into<cgmath::Rad<f32>>>(
-        fovy: A,
-        aspect: f32,
-        near: f32,
-        far: f32,
-    ) -> Matrix4<f32> {
-        use cgmath::{Angle, Rad};
-        let f: Rad<f32> = fovy.into();
-        let f = f / 2.0;
-        let f = Rad::cot(f);
-        Matrix4::<f32>::new(
-            f / aspect,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            -f,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            far / (near - far),
-            -1.0,
-            0.0,
-            0.0,
-            (near * far) / (near - far),
-            0.0,
-        )
-    }
-}
-
-// Vertex struct
-#[repr(C)]
-#[derive(Debug, Clone)]
-struct Vertex {
-    position: Vector3<f32>,
-    normal: Vector3<f32>,
-}
-impl Vertex {
-    fn get_binding_descriptions() -> [vk::VertexInputBindingDescription; 1] {
-        [vk::VertexInputBindingDescription::builder()
-            .binding(0)
-            .stride(std::mem::size_of::<Self>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)
-            .build()]
-    }
-
-    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
-        [
-            vk::VertexInputAttributeDescription::builder()
-                .binding(0)
-                .location(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(offset_of!(Self, position) as u32)
-                .build(),
-            vk::VertexInputAttributeDescription::builder()
-                .binding(0)
-                .location(1)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(offset_of!(Self, normal) as u32)
-                .build(),
-        ]
-    }
-}
-
-// Uniform Buffer object
-#[derive(AsStd140)]
-struct UniformBufferObject {
-    light: mint::Vector3<f32>,
-    model: mint::ColumnMatrix4<f32>,
-    view: mint::ColumnMatrix4<f32>,
-    proj: mint::ColumnMatrix4<f32>,
-}
-
-#[derive(Debug, PartialEq)]
-enum EguiTheme {
-    Dark,
-    Light,
-}
-
-// main app
-struct App {
-    width: u32,
-    height: u32,
-    window: Window,
-    _entry: Entry,
-    instance: Instance,
-    #[cfg(debug_assertions)]
-    debug_utils_loader: DebugUtils,
-    #[cfg(debug_assertions)]
-    debug_callback: DebugUtilsMessengerEXT,
-    surface_loader: Surface,
-    surface: vk::SurfaceKHR,
-    physical_device: vk::PhysicalDevice,
-    graphics_queue_index: u32,
-    present_queue_index: u32,
+/// egui integration with winit and ash.
+pub struct Integration<A: AllocatorTrait> {
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
+    context: Context,
+    egui_winit: egui_winit::State,
     device: Device,
-    graphics_queue: vk::Queue,
-    present_queue: vk::Queue,
-    graphics_command_pool: vk::CommandPool,
+    allocator: A,
+    qfi: u32,
+    queue: vk::Queue,
     swapchain_loader: Swapchain,
-    swapchain: vk::SwapchainKHR,
-    format: vk::SurfaceFormatKHR,
-    extent: vk::Extent2D,
-    swapchain_images: Vec<vk::Image>,
-    allocator: ManuallyDrop<Arc<Mutex<Allocator>>>,
-    render_pass: vk::RenderPass,
-    framebuffers: Vec<vk::Framebuffer>,
-    depth_images: Vec<vk::Image>,
-    depth_image_allocations: Vec<Allocation>,
-    color_image_views: Vec<vk::ImageView>,
-    depth_image_views: Vec<vk::ImageView>,
-    uniform_buffers: Vec<vk::Buffer>,
-    uniform_buffer_allocations: Vec<Allocation>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
-    descriptor_sets: Vec<vk::DescriptorSet>,
-    graphics_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    vertices: Vec<Vertex>,
-    vertex_buffer: vk::Buffer,
-    vertex_buffer_allocation: Option<Allocation>,
-    fences: Vec<vk::Fence>,
-    current_frame: usize,
-    image_available_semaphores: Vec<vk::Semaphore>,
-    render_finished_semaphores: Vec<vk::Semaphore>,
-    command_buffers: Vec<vk::CommandBuffer>,
+    pipeline: vk::Pipeline,
+    sampler: vk::Sampler,
+    vertex_buffers: Vec<vk::Buffer>,
+    vertex_buffer_allocations: Vec<A::Allocation>,
+    index_buffers: Vec<vk::Buffer>,
+    index_buffer_allocations: Vec<A::Allocation>,
+    texture_desc_sets: AHashMap<TextureId, vk::DescriptorSet>,
+    texture_images: AHashMap<TextureId, vk::Image>,
+    texture_image_infos: AHashMap<TextureId, vk::ImageCreateInfo>,
+    texture_allocations: AHashMap<TextureId, A::Allocation>,
+    texture_image_views: AHashMap<TextureId, vk::ImageView>,
 
-    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration<Arc<Mutex<Allocator>>>>,
-    theme: EguiTheme,
-    rotation: f32,
-    light_position: Vector3<f32>,
-    text: String,
+    user_texture_layout: vk::DescriptorSetLayout,
+    user_textures: Vec<Option<vk::DescriptorSet>>,
 }
-impl App {
-    fn new(event_loop: &EventLoop<()>) -> Result<Self> {
-        let (width, height) = (800, 600);
-        let title = "Test";
+impl<A: AllocatorTrait> Integration<A> {
+    /// Create an instance of the integration.
+    pub fn new<T>(
+        event_loop: &EventLoop<T>,
+        physical_width: u32,
+        physical_height: u32,
+        scale_factor: f64,
+        font_definitions: egui::FontDefinitions,
+        style: egui::Style,
+        device: Device,
+        allocator: A,
+        qfi: u32,
+        queue: vk::Queue,
+        swapchain_loader: Swapchain,
+        swapchain: vk::SwapchainKHR,
+        surface_format: vk::SurfaceFormatKHR,
+    ) -> Self {
 
-        // Create Window
-        let window = WindowBuilder::new()
-            .with_title(title)
-            .with_inner_size(PhysicalSize::new(width, height))
-            .with_resizable(true)
-            .build(event_loop)?;
+        // Create context
+        let context = Context::default();
+        context.set_fonts(font_definitions);
+        context.set_style(style);
 
-        // Create Entry
-        let entry = Entry::linked();
+        let egui_winit = egui_winit::State::new(&event_loop);
 
-        // Create Instance
-        let instance = {
-            // App info
-            let app_name = CString::new(title)?;
-            let engine_name = CString::new("Vulkan Engine")?;
-            let app_info = vk::ApplicationInfo::builder()
-                .api_version(vk::make_api_version(0, 1, 2, 0))
-                .application_version(vk::make_api_version(0, 0, 1, 0))
-                .application_name(&app_name)
-                .engine_version(vk::make_api_version(0, 0, 1, 0))
-                .engine_name(&engine_name);
+        // Get swap_images to get len of swapchain images and to create framebuffers
+        let swap_images = unsafe {
+            swapchain_loader
+                .get_swapchain_images(swapchain)
+                .expect("Failed to get swapchain images.")
+        };
 
-            // Get extensions for creating Surface
-            let extension_names = enumerate_required_extensions(window.raw_display_handle())?;
-            let mut extension_names = extension_names
-                .iter()
-                .map(|name| *name)
-                .collect::<Vec<_>>();
-            if ENABLE_VALIDATION_LAYERS {
-                extension_names.push(DebugUtils::name().as_ptr());
+        // Create DescriptorPool
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::builder()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                    .max_sets(1024)
+                    .pool_sizes(&[vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1024)
+                        .build()]),
+                None,
+            )
+        }
+            .expect("Failed to create descriptor pool.");
+
+        // Create DescriptorSetLayouts
+        let descriptor_set_layouts = {
+            let mut sets = vec![];
+            for _ in 0..swap_images.len() {
+                sets.push(
+                    unsafe {
+                        device.create_descriptor_set_layout(
+                            &vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                                vk::DescriptorSetLayoutBinding::builder()
+                                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                    .descriptor_count(1)
+                                    .binding(0)
+                                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                                    .build(),
+                            ]),
+                            None,
+                        )
+                    }
+                        .expect("Failed to create descriptor set layout."),
+                );
             }
-
-            // layer for validation
-            let enabled_layer_names = VALIDATION
-                .iter()
-                .map(|layer_name| CString::new(*layer_name).unwrap())
-                .collect::<Vec<_>>();
-            let enabled_layer_names = enabled_layer_names
-                .iter()
-                .map(|layer_name| layer_name.as_ptr())
-                .collect::<Vec<_>>();
-
-            // instance create info
-            let create_info = vk::InstanceCreateInfo::builder()
-                .application_info(&app_info)
-                .enabled_extension_names(extension_names.as_slice());
-            let create_info = if ENABLE_VALIDATION_LAYERS {
-                create_info.enabled_layer_names(&enabled_layer_names)
-            } else {
-                create_info
-            };
-
-            // crate instance
-            unsafe { entry.create_instance(&create_info, None)? }
+            sets
         };
 
-        #[cfg(debug_assertions)]
-        let (debug_utils_loader, debug_callback) = {
-            // callback function
-            unsafe extern "system" fn callback(
-                message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-                message_type: vk::DebugUtilsMessageTypeFlagsEXT,
-                p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-                _p_user_data: *mut c_void,
-            ) -> vk::Bool32 {
-                let severity = match message_severity {
-                    vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => "[Verbose]",
-                    vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => "[Warning]",
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => "[Error]",
-                    vk::DebugUtilsMessageSeverityFlagsEXT::INFO => "[Info]",
-                    _ => "[Unknown]",
-                };
-                let types = match message_type {
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "[General]",
-                    vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE => "[Performance]",
-                    vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION => "[Validation]",
-                    _ => "[Unknown]",
-                };
-                let message = CStr::from_ptr((*p_callback_data).p_message);
-                println!("[Debug]{}{}{:?}", severity, types, message);
+        // Create PipelineLayout
+        let pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::builder()
+                    .set_layouts(&descriptor_set_layouts)
+                    .push_constant_ranges(&[vk::PushConstantRange::builder()
+                        .stage_flags(vk::ShaderStageFlags::VERTEX)
+                        .offset(0)
+                        .size(std::mem::size_of::<f32>() as u32 * 2) // screen size
+                        .build()]),
+                None,
+            )
+        }
+            .expect("Failed to create pipeline layout.");
 
-                vk::FALSE
-            }
-            let debug_utils_messenger_create_info_ext =
-                vk::DebugUtilsMessengerCreateInfoEXT::builder()
-                    .message_severity(
-                        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                            // | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-                            // | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                            | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-                    )
-                    .message_type(
-                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-                    )
-                    .pfn_user_callback(Some(callback));
-            let debug_utils_loader = DebugUtils::new(&entry, &instance);
-            let debug_callback = unsafe {
-                debug_utils_loader
-                    .create_debug_utils_messenger(&debug_utils_messenger_create_info_ext, None)?
-            };
-            (debug_utils_loader, debug_callback)
-        };
+        // Create Pipeline
+        let pipeline = {
+            let bindings = [vk::VertexInputBindingDescription::builder()
+                .binding(0)
+                .input_rate(vk::VertexInputRate::VERTEX)
+                .stride(
+                    4 * std::mem::size_of::<f32>() as u32 + 4 * std::mem::size_of::<u8>() as u32,
+                )
+                .build()];
 
-        // Create Surface
-        let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe { create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)? };
-
-        // Select Physical Device
-        let (physical_device, graphics_queue_index, present_queue_index) = {
-            // filter physical device
-            let physical_devices = unsafe { instance.enumerate_physical_devices()? };
-            let mut physical_devices = physical_devices.into_iter().filter_map(|physical_device| {
-                // Check if the required queue family is supported.
-                // Check if graphics and present are supported.
-                // In some cases, both may have the same index.
-                let queue_families = unsafe {
-                    instance.get_physical_device_queue_family_properties(physical_device)
-                };
-                let mut graphics_queue_index = None;
-                let mut present_queue_index = None;
-                for (i, queue_family) in queue_families.iter().enumerate() {
-                    if queue_family.queue_count > 0
-                        && queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                    {
-                        graphics_queue_index = Some(i as u32);
-                    }
-
-                    let is_present_support = unsafe {
-                        surface_loader
-                            .get_physical_device_surface_support(physical_device, i as u32, surface)
-                            .unwrap()
-                    };
-                    if queue_family.queue_count > 0 && is_present_support {
-                        present_queue_index = Some(i as u32);
-                    }
-
-                    if graphics_queue_index.is_some() && present_queue_index.is_some() {
-                        break;
-                    }
-                }
-                let is_queue_families_supported =
-                    graphics_queue_index.is_some() && present_queue_index.is_some();
-
-                // Check if the extensions specified in DEVICE_EXTENSIONS are supported.
-                let is_device_extension_supported = {
-                    let available_extensions = unsafe {
-                        instance
-                            .enumerate_device_extension_properties(physical_device)
-                            .unwrap()
-                    };
-                    let mut available_extension_names = vec![];
-                    for extension in available_extensions.iter() {
-                        let extension_name = vk_to_string(&extension.extension_name);
-                        available_extension_names.push(extension_name);
-                    }
-                    let mut required_extensions = HashSet::new();
-                    for extension in DEVICE_EXTENSIONS.iter() {
-                        required_extensions.insert(extension.to_string());
-                    }
-                    for extension in available_extension_names.iter() {
-                        required_extensions.remove(extension);
-                    }
-                    required_extensions.is_empty()
-                };
-
-                // Check if Swapchain is supported.
-                let is_swapchain_supported = if is_device_extension_supported {
-                    let formats = unsafe {
-                        surface_loader
-                            .get_physical_device_surface_formats(physical_device, surface)
-                            .unwrap()
-                    };
-                    let present_modes = unsafe {
-                        surface_loader
-                            .get_physical_device_surface_present_modes(physical_device, surface)
-                            .unwrap()
-                    };
-                    !formats.is_empty() && !present_modes.is_empty()
-                } else {
-                    false
-                };
-
-                if is_queue_families_supported
-                    && is_device_extension_supported
-                    && is_swapchain_supported
-                {
-                    Some((
-                        physical_device,
-                        graphics_queue_index.unwrap(),
-                        present_queue_index.unwrap(),
-                    ))
-                } else {
-                    None
-                }
-            });
-
-            // Select the first physical device that satisfies the conditions.
-            physical_devices.next().unwrap()
-        };
-
-        // Create Device
-        let device = {
-            let mut unique_queue_families = HashSet::new();
-            unique_queue_families.insert(graphics_queue_index);
-            unique_queue_families.insert(present_queue_index);
-
-            let queue_priorities = [1.0];
-            let mut queue_create_infos = vec![];
-            for &queue_family in unique_queue_families.iter() {
-                let queue_create_info = vk::DeviceQueueCreateInfo::builder()
-                    .queue_family_index(queue_family)
-                    .queue_priorities(&queue_priorities)
-                    .build();
-                queue_create_infos.push(queue_create_info);
-            }
-
-            let enabled_extension_names = [Swapchain::name().as_ptr()];
-
-            let device_create_info = vk::DeviceCreateInfo::builder()
-                .queue_create_infos(queue_create_infos.as_slice())
-                .enabled_extension_names(&enabled_extension_names);
-
-            unsafe { instance.create_device(physical_device, &device_create_info, None)? }
-        };
-
-        // Create Queues
-        let graphics_queue = unsafe { device.get_device_queue(graphics_queue_index, 0) };
-        let present_queue = unsafe { device.get_device_queue(present_queue_index, 0) };
-
-        // Create Graphics Command Pool
-        let graphics_command_pool = {
-            let command_pool_create_info = vk::CommandPoolCreateInfo::builder()
-                .queue_family_index(graphics_queue_index)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-            unsafe { device.create_command_pool(&command_pool_create_info, None)? }
-        };
-
-        // Create Swapchain
-        let swapchain_loader = Swapchain::new(&instance, &device);
-        let (swapchain, format, extent) = {
-            let capabilities = unsafe {
-                surface_loader.get_physical_device_surface_capabilities(physical_device, surface)?
-            };
-            let formats = unsafe {
-                surface_loader
-                    .get_physical_device_surface_formats(physical_device, surface)
-                    .unwrap()
-            };
-            let present_modes = unsafe {
-                surface_loader
-                    .get_physical_device_surface_present_modes(physical_device, surface)
-                    .unwrap()
-            };
-
-            let format = formats
-                .iter()
-                .find(|f| {
-                    f.format == vk::Format::B8G8R8A8_UNORM || f.format == vk::Format::R8G8B8A8_UNORM
-                })
-                .unwrap_or(&formats[0])
-                .clone();
-            let present_mode = present_modes
-                .into_iter()
-                .find(|&p| p == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO);
-            let extent = {
-                if capabilities.current_extent.width != u32::max_value() {
-                    capabilities.current_extent
-                } else {
-                    vk::Extent2D {
-                        width: width
-                            .max(capabilities.min_image_extent.width)
-                            .min(capabilities.max_image_extent.width),
-                        height: height
-                            .max(capabilities.min_image_extent.height)
-                            .min(capabilities.max_image_extent.height),
-                    }
-                }
-            };
-
-            let image_count = capabilities.min_image_count + 1;
-            let image_count = if capabilities.max_image_count != 0 {
-                image_count.min(capabilities.max_image_count)
-            } else {
-                image_count
-            };
-
-            let (image_sharing_mode, queue_family_indices) =
-                if graphics_queue_index != present_queue_index {
-                    (
-                        vk::SharingMode::EXCLUSIVE,
-                        vec![graphics_queue_index, present_queue_index],
-                    )
-                } else {
-                    (vk::SharingMode::EXCLUSIVE, vec![])
-                };
-
-            let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
-                .surface(surface)
-                .min_image_count(image_count)
-                .image_format(format.format)
-                .image_color_space(format.color_space)
-                .image_extent(extent)
-                .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                .image_sharing_mode(image_sharing_mode)
-                .queue_family_indices(queue_family_indices.as_slice())
-                .pre_transform(capabilities.current_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(present_mode)
-                .clipped(true);
-
-            let swapchain =
-                unsafe { swapchain_loader.create_swapchain(&swapchain_create_info, None)? };
-            (swapchain, format, extent)
-        };
-        let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
-
-        // Prepare gpu-allocator's Allocator
-        let mut allocator = {
-            Allocator::new(&AllocatorCreateDesc {
-                instance: instance.clone(),
-                device: device.clone(),
-                physical_device,
-                debug_settings: Default::default(),
-                buffer_device_address: false,
-            })?
-        };
-
-        // Create RenderPass
-        let render_pass = {
-            // Attachments
-            let attachments = [
-                vk::AttachmentDescription::builder()
-                    .format(format.format)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            let attributes = [
+                // position
+                vk::VertexInputAttributeDescription::builder()
+                    .binding(0)
+                    .offset(0)
+                    .location(0)
+                    .format(vk::Format::R32G32_SFLOAT)
                     .build(),
-                vk::AttachmentDescription::builder()
-                    .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                // uv
+                vk::VertexInputAttributeDescription::builder()
+                    .binding(0)
+                    .offset(8)
+                    .location(1)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .build(),
+                // color
+                vk::VertexInputAttributeDescription::builder()
+                    .binding(0)
+                    .offset(16)
+                    .location(2)
+                    .format(vk::Format::R8G8B8A8_UNORM)
                     .build(),
             ];
-            // color reference
-            let color_reference = [vk::AttachmentReference::builder()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .build()];
-            // depth reference
-            let depth_reference = vk::AttachmentReference::builder()
-                .attachment(1)
-                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-            // subpass descriptionを作成
-            let subpasses = [vk::SubpassDescription::builder()
-                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(&color_reference)
-                .depth_stencil_attachment(&depth_reference)
-                .build()];
-            // create render pass
-            let render_pass_create_info = vk::RenderPassCreateInfo::builder()
-                .attachments(&attachments)
-                .subpasses(&subpasses);
-            unsafe { device.create_render_pass(&render_pass_create_info, None)? }
-        };
 
-        // Create framebuffers and depth buffers
-        let (
-            framebuffers,
-            depth_images,
-            depth_image_allocations,
-            color_image_views,
-            depth_image_views,
-        ) = {
-            let mut framebuffers = vec![];
-            let mut depth_images = vec![];
-            let mut depth_image_allocations = vec![];
-            let mut color_image_views = vec![];
-            let mut depth_image_views = vec![];
-
-            for &image in swapchain_images.iter() {
-                let mut attachments = vec![];
-
-                let color_attachment = unsafe {
-                    device.create_image_view(
-                        &vk::ImageViewCreateInfo::builder()
-                            .image(image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(format.format)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::builder()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1)
-                                    .build(),
-                            ),
-                        None,
-                    )?
-                };
-                attachments.push(color_attachment);
-                color_image_views.push(color_attachment);
-
-                let depth_image_create_info = vk::ImageCreateInfo::builder()
-                    .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D {
-                        width: extent.width,
-                        height: extent.height,
-                        depth: 1,
-                    });
-                let depth_image = unsafe { device.create_image(&depth_image_create_info, None)? };
-                let depth_image_requirements =
-                    unsafe { device.get_image_memory_requirements(depth_image) };
-                let depth_image_allocation = allocator.allocate(&AllocationCreateDesc {
-                    name: "depth image",
-                    requirements: depth_image_requirements,
-                    location: gpu_allocator::MemoryLocation::GpuOnly,
-                    linear: false,
-                })?;
-                unsafe {
-                    device.bind_image_memory(
-                        depth_image,
-                        depth_image_allocation.memory(),
-                        depth_image_allocation.offset(),
-                    )?;
-                }
-                depth_images.push(depth_image);
-                depth_image_allocations.push(depth_image_allocation);
-                let depth_attachment = unsafe {
-                    device.create_image_view(
-                        &vk::ImageViewCreateInfo::builder()
-                            .image(depth_image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::D32_SFLOAT)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::builder()
-                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1)
-                                    .build(),
-                            ),
-                        None,
-                    )?
-                };
-                attachments.push(depth_attachment);
-                depth_image_views.push(depth_attachment);
-                framebuffers.push(unsafe {
-                    device.create_framebuffer(
-                        &vk::FramebufferCreateInfo::builder()
-                            .render_pass(render_pass)
-                            .attachments(attachments.as_slice())
-                            .width(extent.width)
-                            .height(extent.height)
-                            .layers(1),
-                        None,
-                    )?
-                });
-            }
-
-            (
-                framebuffers,
-                depth_images,
-                depth_image_allocations,
-                color_image_views,
-                depth_image_views,
-            )
-        };
-
-        // Prepare UniformBuffer
-        let (uniform_buffers, uniform_buffer_allocations) = {
-            (0..swapchain_images.len())
-                .map(|_| {
-                    // Calculate size
-                    let buffer_size = std::mem::size_of::<Std140UniformBufferObject>() as u64;
-                    // Reserve buffer
-                    let buffer = unsafe {
-                        device
-                            .create_buffer(
-                                &vk::BufferCreateInfo::builder()
-                                    .size(buffer_size)
-                                    .usage(vk::BufferUsageFlags::UNIFORM_BUFFER),
-                                None,
-                            )
-                            .unwrap()
-                    };
-                    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-                    let buffer_allocation = allocator
-                        .allocate(&AllocationCreateDesc {
-                            name: "uniform buffer",
-                            requirements,
-                            location: gpu_allocator::MemoryLocation::CpuToGpu,
-                            linear: true,
-                        })
-                        .unwrap();
-                    unsafe {
-                        device
-                            .bind_buffer_memory(
-                                buffer,
-                                buffer_allocation.memory(),
-                                buffer_allocation.offset(),
-                            )
-                            .unwrap();
-                    }
-                    (buffer, buffer_allocation)
-                })
-                .unzip::<_, _, Vec<_>, Vec<_>>()
-        };
-        // Create DescriptorPool
-        let descriptor_pool = {
-            let pool_sizes = [vk::DescriptorPoolSize::builder()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(swapchain_images.len() as u32)
-                .build()];
-            let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::builder()
-                .max_sets(swapchain_images.len() as u32)
-                .pool_sizes(&pool_sizes);
-            unsafe { device.create_descriptor_pool(&descriptor_pool_create_info, None)? }
-        };
-        // Create Descriptor Set Layout Bindings
-        let descriptor_set_layout_bindings = vec![vk::DescriptorSetLayoutBinding::builder()
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .binding(0)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .build()];
-        // Create Descriptor Set Layout
-        let descriptor_set_layouts = (0..swapchain_images.len())
-            .map(|_| {
-                let descriptor_set_layout_create_info =
-                    vk::DescriptorSetLayoutCreateInfo::builder()
-                        .bindings(descriptor_set_layout_bindings.as_slice());
-                unsafe {
-                    device
-                        .create_descriptor_set_layout(&descriptor_set_layout_create_info, None)
-                        .unwrap()
-                }
-            })
-            .collect::<Vec<_>>();
-        // Cerate Descriptor Sets
-        let descriptor_sets = {
-            let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo::builder()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(descriptor_set_layouts.as_slice());
-            unsafe { device.allocate_descriptor_sets(&descriptor_set_allocate_info) }
-        }?;
-        // Update Descriptor sets
-        for i in 0..swapchain_images.len() {
-            let descriptor_buffer_infos = [vk::DescriptorBufferInfo::builder()
-                .buffer(uniform_buffers[i])
-                .offset(0)
-                .range(std::mem::size_of::<Std140UniformBufferObject>() as u64)
-                .build()];
-            let write_descriptor_sets = [vk::WriteDescriptorSet::builder()
-                .dst_set(descriptor_sets[i])
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&descriptor_buffer_infos)
-                .build()];
-            unsafe {
-                device.update_descriptor_sets(&write_descriptor_sets, &[]);
-            }
-        }
-
-        // Setup Graphics Pipeline
-        let (graphics_pipeline, pipeline_layout) = {
-            // load shaders
             let vertex_shader_module = {
-                use std::fs::File;
-                use std::io::Read;
-
-                let spv_file = File::open(&Path::new(VERTEX_SHADER_PASS))?;
-                let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
-
+                let bytes_code = include_bytes!("shaders/spv/vert.spv");
                 let shader_module_create_info = vk::ShaderModuleCreateInfo {
                     code_size: bytes_code.len(),
                     p_code: bytes_code.as_ptr() as *const u32,
                     ..Default::default()
                 };
-                unsafe { device.create_shader_module(&shader_module_create_info, None)? }
+                unsafe { device.create_shader_module(&shader_module_create_info, None) }
+                    .expect("Failed to create vertex shader module.")
             };
             let fragment_shader_module = {
-                use std::fs::File;
-                use std::io::Read;
-
-                let spv_file = File::open(&Path::new(FRAGMENT_SHADER_PASS))?;
-                let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
-
+                let bytes_code = include_bytes!("shaders/spv/frag.spv");
                 let shader_module_create_info = vk::ShaderModuleCreateInfo {
                     code_size: bytes_code.len(),
                     p_code: bytes_code.as_ptr() as *const u32,
                     ..Default::default()
                 };
-                unsafe { device.create_shader_module(&shader_module_create_info, None)? }
+                unsafe { device.create_shader_module(&shader_module_create_info, None) }
+                    .expect("Failed to create fragment shader module.")
             };
-            // name main function
             let main_function_name = CString::new("main").unwrap();
-            // prepare shader stages info
             let pipeline_shader_stages = [
                 vk::PipelineShaderStageCreateInfo::builder()
                     .stage(vk::ShaderStageFlags::VERTEX)
@@ -830,25 +202,12 @@ impl App {
                     .name(&main_function_name)
                     .build(),
             ];
-            // Pipeline Layout
-            let pipeline_layout = unsafe {
-                device.create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::builder().set_layouts(&descriptor_set_layouts),
-                    None,
-                )?
-            };
-            // VertexInputBinding
-            let vertex_input_binding = Vertex::get_binding_descriptions();
-            // Vertex Input Attribute Descriptions
-            let vertex_input_attribute = Vertex::get_attribute_descriptions();
-            // input_assembly info
+
             let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-            // viewport info
             let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
                 .viewport_count(1)
                 .scissor_count(1);
-            // rasterization_info
             let rasterization_info = vk::PipelineRasterizationStateCreateInfo::builder()
                 .depth_clamp_enable(false)
                 .rasterizer_discard_enable(false)
@@ -857,22 +216,19 @@ impl App {
                 .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
                 .depth_bias_enable(false)
                 .line_width(1.0);
-            // stencil op
             let stencil_op = vk::StencilOpState::builder()
                 .fail_op(vk::StencilOp::KEEP)
                 .pass_op(vk::StencilOp::KEEP)
                 .compare_op(vk::CompareOp::ALWAYS)
                 .build();
-            // depth stencil op
             let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
-                .depth_test_enable(true)
-                .depth_write_enable(true)
-                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+                .depth_test_enable(false)
+                .depth_write_enable(false)
+                .depth_compare_op(vk::CompareOp::ALWAYS)
                 .depth_bounds_test_enable(false)
                 .stencil_test_enable(false)
                 .front(stencil_op)
                 .back(stencil_op);
-            // color blend attachments
             let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
                 .color_write_mask(
                     vk::ColorComponentFlags::R
@@ -880,21 +236,21 @@ impl App {
                         | vk::ColorComponentFlags::B
                         | vk::ColorComponentFlags::A,
                 )
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .build()];
             let color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
                 .attachments(&color_blend_attachments);
-            // dynamic state
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic_state_info =
                 vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
-            // Vertex input state create info
             let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
-                .vertex_attribute_descriptions(&vertex_input_attribute)
-                .vertex_binding_descriptions(&vertex_input_binding);
-            // multi sample info
+                .vertex_attribute_descriptions(&attributes)
+                .vertex_binding_descriptions(&bindings);
             let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-            // pipeline create info
+
             let pipeline_create_info = [vk::GraphicsPipelineCreateInfo::builder()
                 .stages(&pipeline_shader_stages)
                 .vertex_input_state(&vertex_input_state)
@@ -906,938 +262,1049 @@ impl App {
                 .color_blend_state(&color_blend_info)
                 .dynamic_state(&dynamic_state_info)
                 .layout(pipeline_layout)
-                .render_pass(render_pass)
-                .subpass(0)
                 .build()];
-            // Graphics Pipeline
-            let graphics_pipeline = unsafe {
-                device
-                    .create_graphics_pipelines(
-                        vk::PipelineCache::null(),
-                        &pipeline_create_info,
-                        None,
-                    )
-                    .unwrap()[0]
-            };
+
+            let pipeline = unsafe {
+                device.create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &pipeline_create_info,
+                    None,
+                )
+            }
+                .expect("Failed to create graphics pipeline.")[0];
             unsafe {
                 device.destroy_shader_module(vertex_shader_module, None);
                 device.destroy_shader_module(fragment_shader_module, None);
             }
-
-            (graphics_pipeline, pipeline_layout)
+            pipeline
         };
 
-        // vertices
-        let vertices = {
-            let model_obj = tobj::load_obj(
-                MODEL_PATH,
-                &tobj::LoadOptions {
-                    single_index: true,
-                    triangulate: true,
-                    ..Default::default()
-                },
-            )?;
-            let mut vertices = vec![];
-            let (models, _) = model_obj;
-            for m in models.iter() {
-                let mesh = &m.mesh;
-                for &i in mesh.indices.iter() {
-                    let i = i as usize;
-                    let vertex = Vertex {
-                        position: Vector3::new(
-                            mesh.positions[3 * i],
-                            mesh.positions[3 * i + 1],
-                            mesh.positions[3 * i + 2],
-                        ),
-                        normal: Vector3::new(
-                            mesh.normals[3 * i],
-                            mesh.normals[3 * i + 1],
-                            mesh.normals[3 * i + 2],
-                        ),
-                    };
-                    vertices.push(vertex);
-                }
-            }
-            vertices
-        };
-        let vertex_buffer_size = vertices.len() as u64 * std::mem::size_of::<Vertex>() as u64;
-
-        // temporary CPU to GPU buffer
-        let temporary_vertex_buffer = unsafe {
-            device.create_buffer(
-                &vk::BufferCreateInfo::builder()
-                    .size(vertex_buffer_size)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+        // Create Sampler
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::builder()
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .anisotropy_enable(false)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mag_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .min_lod(0.0)
+                    .max_lod(vk::LOD_CLAMP_NONE),
                 None,
-            )?
-        };
-        let requirements =
-            unsafe { device.get_buffer_memory_requirements(temporary_vertex_buffer) };
-        let temporary_vertex_buffer_allocation = allocator.allocate(&AllocationCreateDesc {
-            name: "Temporary Vertex Buffer",
-            requirements,
-            location: gpu_allocator::MemoryLocation::CpuToGpu,
-            linear: true,
-        })?;
-        unsafe {
-            device.bind_buffer_memory(
-                temporary_vertex_buffer,
-                temporary_vertex_buffer_allocation.memory(),
-                temporary_vertex_buffer_allocation.offset(),
-            )?;
-        }
-        unsafe {
-            let ptr = temporary_vertex_buffer_allocation
-                .mapped_ptr()
-                .unwrap()
-                .as_ptr() as *mut Vertex;
-            ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
-        }
-
-        // vertex buffer
-        let vertex_buffer = unsafe {
-            device.create_buffer(
-                &vk::BufferCreateInfo::builder()
-                    .size(vertex_buffer_size)
-                    .usage(
-                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
-                    ),
-                None,
-            )?
-        };
-        let requirements = unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
-        let vertex_buffer_allocation = allocator.allocate(&AllocationCreateDesc {
-            name: "Vertex Buffer",
-            requirements,
-            location: gpu_allocator::MemoryLocation::GpuOnly,
-            linear: true,
-        })?;
-        unsafe {
-            device.bind_buffer_memory(
-                vertex_buffer,
-                vertex_buffer_allocation.memory(),
-                vertex_buffer_allocation.offset(),
-            )?;
-        }
-
-        // copy vertices data from temporary buffer to vertex buffer
-        {
-            // create onetime command
-            let copy_cmd = unsafe {
-                device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::builder()
-                        .command_pool(graphics_command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )?
-            }[0];
-            unsafe {
-                device.begin_command_buffer(
-                    copy_cmd,
-                    &vk::CommandBufferBeginInfo::builder()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                device.cmd_copy_buffer(
-                    copy_cmd,
-                    temporary_vertex_buffer,
-                    vertex_buffer,
-                    &[vk::BufferCopy::builder()
-                        .src_offset(0)
-                        .dst_offset(0)
-                        .size(vertex_buffer_size)
-                        .build()],
-                );
-                device.end_command_buffer(copy_cmd)?;
-
-                device.queue_submit(
-                    graphics_queue,
-                    &[vk::SubmitInfo::builder()
-                        .command_buffers(&[copy_cmd])
-                        .build()],
-                    vk::Fence::null(),
-                )?;
-                device.queue_wait_idle(graphics_queue)?;
-
-                device.free_command_buffers(graphics_command_pool, &[copy_cmd]);
-            }
-
-            // destroy temporary buffer
-            allocator.free(temporary_vertex_buffer_allocation)?;
-            unsafe {
-                device.destroy_buffer(temporary_vertex_buffer, None);
-            }
-        }
-        let vertex_buffer_allocation = Some(vertex_buffer_allocation);
-
-        // Create sync objects
-        let (fences, image_available_semaphores, render_finished_semaphores) = unsafe {
-            let mut fences = vec![];
-            let mut image_available_semaphores = vec![];
-            let mut render_finished_semaphores = vec![];
-            for _ in 0..MAX_FRAMES_IN_FLIGHT {
-                fences.push(device.create_fence(
-                    &vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )?);
-                image_available_semaphores
-                    .push(device.create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)?);
-                render_finished_semaphores
-                    .push(device.create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)?);
-            }
-            (
-                fences,
-                image_available_semaphores,
-                render_finished_semaphores,
             )
-        };
+        }
+            .expect("Failed to create sampler.");
 
-        // create command_buffers
-        let command_buffers = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::builder()
-                    .command_pool(graphics_command_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(swapchain_images.len() as u32),
-            )?
-        };
+        // Create vertex buffer and index buffer
+        let mut vertex_buffers = vec![];
+        let mut vertex_buffer_allocations = vec![];
+        let mut index_buffers = vec![];
+        let mut index_buffer_allocations = vec![];
+        for _ in 0..swap_images.len() {
+            let vertex_buffer = unsafe {
+                device
+                    .create_buffer(
+                        &vk::BufferCreateInfo::builder()
+                            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                            .size(Self::vertex_buffer_size()),
+                        None,
+                    )
+                    .expect("Failed to create vertex buffer.")
+            };
+            let vertex_buffer_requirements =
+                unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
+            let vertex_buffer_allocation = allocator
+                .allocate(A::AllocationCreateInfo::new(
+                    vertex_buffer_requirements,
+                    MemoryLocation::CpuToGpu,
+                    true,
+                ))
+                .expect("Failed to create vertex buffer.");
+            unsafe {
+                device
+                    .bind_buffer_memory(
+                        vertex_buffer,
+                        vertex_buffer_allocation.memory(),
+                        vertex_buffer_allocation.offset(),
+                    )
+                    .expect("Failed to create vertex buffer.")
+            }
 
-        // Wrap the allocator with ArcMutex to share the allocator between integration and App.
-        let allocator = Arc::new(Mutex::new(allocator));
+            let index_buffer = unsafe {
+                device
+                    .create_buffer(
+                        &vk::BufferCreateInfo::builder()
+                            .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                            .size(Self::index_buffer_size()),
+                        None,
+                    )
+                    .expect("Failed to create index buffer.")
+            };
+            let index_buffer_requirements =
+                unsafe { device.get_buffer_memory_requirements(index_buffer) };
+            let index_buffer_allocation = allocator
+                .allocate(A::AllocationCreateInfo::new(
+                    index_buffer_requirements,
+                    MemoryLocation::CpuToGpu,
+                    true,
+                ))
+                .expect("Failed to create index buffer.");
+            unsafe {
+                device
+                    .bind_buffer_memory(
+                        index_buffer,
+                        index_buffer_allocation.memory(),
+                        index_buffer_allocation.offset(),
+                    )
+                    .expect("Failed to create index buffer.")
+            }
 
-        // #### egui ##########################################################################
-        // create integration object
-        // Note: ManuallyDrop is required to drop the allocator to shut it down successfully.
-        let egui_integration = ManuallyDrop::new(egui_winit_ash_integration::Integration::new(
-            event_loop,
-            width,
-            height,
-            window.scale_factor(),
-            egui::FontDefinitions::default(),
-            egui::Style::default(),
-            device.clone(),
-            Arc::clone(&allocator),
-            graphics_queue_index,
-            graphics_queue,
-            swapchain_loader.clone(),
-            swapchain.clone(),
-            format.clone(),
-        ));
-        // #### egui ##########################################################################
+            vertex_buffers.push(vertex_buffer);
+            vertex_buffer_allocations.push(vertex_buffer_allocation);
+            index_buffers.push(index_buffer);
+            index_buffer_allocations.push(index_buffer_allocation);
+        }
 
-        let allocator = ManuallyDrop::new(allocator);
+        // User Textures
+        let user_texture_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                    vk::DescriptorSetLayoutBinding::builder()
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .binding(0)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                        .build(),
+                ]),
+                None,
+            )
+        }
+            .expect("Failed to create descriptor set layout.");
+        let user_textures = vec![];
 
-        Ok(Self {
-            width,
-            height,
-            window,
-            _entry: entry,
-            instance,
-            #[cfg(debug_assertions)]
-            debug_utils_loader,
-            #[cfg(debug_assertions)]
-            debug_callback,
-            surface_loader,
-            surface,
-            physical_device,
-            graphics_queue_index,
-            present_queue_index,
+        Self {
+            physical_width,
+            physical_height,
+            scale_factor,
+            context,
+            egui_winit,
+
             device,
-            graphics_queue,
-            present_queue,
-            graphics_command_pool,
-            swapchain_loader,
-            swapchain,
-            format,
-            extent,
-            swapchain_images,
             allocator,
-            render_pass,
-            framebuffers,
-            depth_images,
-            depth_image_allocations,
-            color_image_views,
-            depth_image_views,
-            uniform_buffers,
-            uniform_buffer_allocations,
+            qfi,
+            queue,
+            swapchain_loader,
             descriptor_pool,
             descriptor_set_layouts,
-            descriptor_sets,
-            graphics_pipeline,
             pipeline_layout,
-            vertices,
-            vertex_buffer,
-            vertex_buffer_allocation,
-            fences,
-            current_frame: 0,
-            image_available_semaphores,
-            render_finished_semaphores,
-            command_buffers,
+            pipeline,
+            sampler,
+            vertex_buffers,
+            vertex_buffer_allocations,
+            index_buffers,
+            index_buffer_allocations,
+            texture_desc_sets: AHashMap::new(),
+            texture_images: AHashMap::new(),
+            texture_image_infos: AHashMap::new(),
+            texture_allocations: AHashMap::new(),
+            texture_image_views: AHashMap::new(),
 
-            egui_integration,
-            theme: EguiTheme::Dark,
-            rotation: 0.0,
-            light_position: Vector3::new(0.0, -16.0, -16.0),
-            text: "Hello egui!".to_string(),
-        })
+            user_texture_layout,
+            user_textures
+        }
     }
 
-    fn draw(&mut self) -> Result<()> {
-        if self.width == 0 || self.height == 0 {
-            return Ok(());
+    // vertex buffer size
+    fn vertex_buffer_size() -> u64 {
+        1024 * 1024 * 4
+    }
+
+    // index buffer size
+    fn index_buffer_size() -> u64 {
+        1024 * 1024 * 2
+    }
+
+    /// handling winit event.
+    pub fn handle_event(&mut self, winit_event: &egui_winit::winit::event::WindowEvent<'_>) -> EventResponse {
+        self.egui_winit.on_event(&self.context, winit_event)
+    }
+
+    /// begin frame.
+    pub fn begin_frame(&mut self, window: &Window) {
+        let raw_input = self.egui_winit.take_egui_input(window);
+        self.context.begin_frame(raw_input);
+    }
+
+    /// end frame.
+    pub fn end_frame(&mut self, window: &Window) -> egui::FullOutput {
+        let output = self.context.end_frame();
+
+        self.egui_winit.handle_platform_output(window, &self.context, output.platform_output.clone());
+
+
+
+        output
+    }
+
+    /// Get [`egui::Context`].
+    pub fn context(&self) -> Context {
+        self.context.clone()
+    }
+
+    /// Record paint commands.
+    pub fn paint(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        swapchain_image_index: usize,
+        clipped_meshes: Vec<egui::ClippedPrimitive>,
+        textures_delta: TexturesDelta
+    ) {
+        let index = swapchain_image_index;
+
+        for (id, image_delta) in textures_delta.set {
+            self.update_texture(id, image_delta);
         }
 
+        let mut vertex_buffer_ptr = self.vertex_buffer_allocations[index]
+            .mapped_ptr()
+            .unwrap()
+            .as_ptr() as *mut u8;
+        // let mut vertex_buffer_ptr = unsafe {
+        //     self.device
+        //         .map_memory(
+        //             self.vertex_buffer_allocations[index].memory(),
+        //             self.vertex_buffer_allocations[index].offset(),
+        //             self.vertex_buffer_allocations[index].size(),
+        //             vk::MemoryMapFlags::empty(),
+        //         )
+        //         .expect("Failed to map buffers.") as *mut u8
+        // };
+        let vertex_buffer_ptr_end =
+            unsafe { vertex_buffer_ptr.add(Self::vertex_buffer_size() as usize) };
+        // let mut index_buffer_ptr = unsafe {
+        //     self.device
+        //         .map_memory(
+        //             self.index_buffer_allocations[index].memory(),
+        //             self.index_buffer_allocations[index].offset(),
+        //             self.index_buffer_allocations[index].size(),
+        //             vk::MemoryMapFlags::empty(),
+        //         )
+        //         .expect("Failed to map buffers.") as *mut u8
+        // };
+        let mut index_buffer_ptr = self.index_buffer_allocations[index]
+            .mapped_ptr()
+            .unwrap()
+            .as_ptr() as *mut u8;
+        let index_buffer_ptr_end =
+            unsafe { index_buffer_ptr.add(Self::index_buffer_size() as usize) };
+
+        // bind resources
         unsafe {
-            // Wait Fence
-            let fence = self.fences[self.current_frame];
-            self.device.wait_for_fences(&[fence], true, std::u64::MAX)?;
-
-            // Acquire next image
-            let image_index;
-            match self.swapchain_loader.acquire_next_image(
-                self.swapchain,
-                std::u64::MAX,
-                self.image_available_semaphores[self.current_frame],
-                vk::Fence::null(),
-            ) {
-                Ok((index, _is_suboptimal)) => image_index = index as usize,
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return self.recreate_swapchain(),
-                Err(error) => panic!("Error while acquiring next image: {}", error),
-            }
-
-            // Reset fence
-            self.device.reset_fences(&[fence])?;
-
-            // Clear value
-            let clear_value = [
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.5, 0.25, 0.25, 0.0],
-                    },
-                },
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-            ];
-
-            // Update UniformBuffer
-            let uniform_buffer_object = UniformBufferObject {
-                light: self.light_position.into(),
-                model: Matrix4::from_axis_angle(Vector3::new(0.0, 1.0, 0.0), Deg(self.rotation))
-                    .into(),
-                view: Matrix4::look_at_rh(
-                    Point3::new(0.0, -2.0, -5.0),
-                    Point3::new(0.0, 0.0, 0.0),
-                    Vector3::new(0.0, -1.0, 0.0),
-                )
-                .into(),
-                proj: Matrix4::perspective(
-                    Deg(60.0),
-                    self.width as f32 / self.height as f32,
-                    0.01,
-                    100.0,
-                )
-                .into(),
-            };
-            let uniform_buffer_object_std140 = uniform_buffer_object.as_std140();
-            {
-                let ptr = self.uniform_buffer_allocations[image_index]
-                    .mapped_ptr()
-                    .unwrap()
-                    .as_ptr() as *mut u8;
-                ptr.copy_from_nonoverlapping(
-                    uniform_buffer_object_std140.as_bytes().as_ptr(),
-                    uniform_buffer_object_std140.as_bytes().len(),
-                );
-            }
-
-            // Setup command
-            let command_buffer = self.command_buffers[image_index];
-
-            self.device
-                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::builder())?;
-
-            self.device.cmd_begin_render_pass(
-                command_buffer,
-                &vk::RenderPassBeginInfo::builder()
-                    .render_pass(self.render_pass)
-                    .framebuffer(self.framebuffers[image_index])
-                    .render_area(
-                        vk::Rect2D::builder()
-                            .offset(vk::Offset2D::builder().x(0).y(0).build())
-                            .extent(self.extent)
-                            .build(),
-                    )
-                    .clear_values(&clear_value),
-                vk::SubpassContents::INLINE,
-            );
             self.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline,
+                self.pipeline,
             );
-            // Set Viewport
+            self.device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                &[self.vertex_buffers[index]],
+                &[0],
+            );
+            self.device.cmd_bind_index_buffer(
+                command_buffer,
+                self.index_buffers[index],
+                0,
+                vk::IndexType::UINT32,
+            );
             self.device.cmd_set_viewport(
                 command_buffer,
                 0,
                 &[vk::Viewport::builder()
-                    .width(self.extent.width as f32)
-                    .height(self.extent.height as f32)
+                    .x(0.0)
+                    .y(0.0)
+                    .width(self.physical_width as f32)
+                    .height(self.physical_height as f32)
                     .min_depth(0.0)
                     .max_depth(1.0)
                     .build()],
             );
-            // Set Scissor
-            self.device.cmd_set_scissor(
+            let width_points = self.physical_width as f32 / self.scale_factor as f32;
+            let height_points = self.physical_height as f32 / self.scale_factor as f32;
+            self.device.cmd_push_constants(
                 command_buffer,
-                0,
-                &[vk::Rect2D::builder()
-                    .offset(vk::Offset2D::builder().build())
-                    .extent(self.extent)
-                    .build()],
-            );
-            // Set Vertex buffer
-            self.device
-                .cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
-            // Set Descriptor Set
-            self.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
                 0,
-                &[self.descriptor_sets[image_index]],
-                &[],
+                bytes_of(&width_points),
             );
-            // Draw Command
-            self.device
-                .cmd_draw(command_buffer, self.vertices.len() as u32, 1, 0, 0);
-
-            self.device.cmd_end_render_pass(command_buffer);
-
-            // #### egui ##########################################################################
-            match self.theme {
-                EguiTheme::Dark => self
-                    .egui_integration
-                    .context()
-                    .set_visuals(egui::style::Visuals::dark()),
-                EguiTheme::Light => self
-                    .egui_integration
-                    .context()
-                    .set_visuals(egui::style::Visuals::light()),
-            }
-
-            self.egui_integration.begin_frame(&self.window);
-            egui::SidePanel::left("my_side_panel").show(&self.egui_integration.context(), |ui| {
-                ui.heading("Hello");
-                ui.label("Hello egui!");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Theme");
-                    let id = ui.make_persistent_id("theme_combo_box_side");
-                    egui::ComboBox::from_id_source(id)
-                        .selected_text(format!("{:?}", self.theme))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.theme, EguiTheme::Dark, "Dark");
-                            ui.selectable_value(&mut self.theme, EguiTheme::Light, "Light");
-                        });
-                });
-                ui.separator();
-                ui.hyperlink("https://github.com/emilk/egui");
-                ui.separator();
-                ui.label("Rotation");
-                ui.add(egui::widgets::DragValue::new(&mut self.rotation));
-                ui.add(egui::widgets::Slider::new(
-                    &mut self.rotation,
-                    -180.0..=180.0,
-                ));
-                ui.label("Light Position");
-                ui.horizontal(|ui| {
-                    ui.label("x:");
-                    ui.add(egui::widgets::DragValue::new(&mut self.light_position.x));
-                    ui.label("y:");
-                    ui.add(egui::widgets::DragValue::new(&mut self.light_position.y));
-                    ui.label("z:");
-                    ui.add(egui::widgets::DragValue::new(&mut self.light_position.z));
-                });
-                ui.separator();
-                ui.text_edit_singleline(&mut self.text);
-            });
-            egui::Window::new("My Window")
-                .resizable(true)
-                .scroll2([true, true])
-                .show(&self.egui_integration.context(), |ui| {
-                    ui.heading("Hello");
-                    ui.label("Hello egui!");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Theme");
-                        let id = ui.make_persistent_id("theme_combo_box_window");
-                        egui::ComboBox::from_id_source(id)
-                            .selected_text(format!("{:?}", self.theme))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.theme, EguiTheme::Dark, "Dark");
-                                ui.selectable_value(&mut self.theme, EguiTheme::Light, "Light");
-                            });
-                    });
-                    ui.separator();
-                    ui.hyperlink("https://github.com/emilk/egui");
-                    ui.separator();
-                    ui.label("Rotation");
-                    ui.add(egui::widgets::DragValue::new(&mut self.rotation));
-                    ui.add(egui::widgets::Slider::new(
-                        &mut self.rotation,
-                        -180.0..=180.0,
-                    ));
-                    ui.label("Light Position");
-                    ui.horizontal(|ui| {
-                        ui.label("x:");
-                        ui.add(egui::widgets::DragValue::new(&mut self.light_position.x));
-                        ui.label("y:");
-                        ui.add(egui::widgets::DragValue::new(&mut self.light_position.y));
-                        ui.label("z:");
-                        ui.add(egui::widgets::DragValue::new(&mut self.light_position.z));
-                    });
-                    ui.separator();
-                    ui.text_edit_singleline(&mut self.text);
-                });
-            let output = self.egui_integration.end_frame(&mut self.window);
-            let clipped_meshes = self.egui_integration.context().tessellate(output.shapes);
-            self.egui_integration
-                .paint(command_buffer, image_index, clipped_meshes, output.textures_delta);
-            // #### egui ##########################################################################
-
-            self.device.end_command_buffer(command_buffer)?;
-
-            // Submit command
-            self.device.queue_submit(
-                self.graphics_queue,
-                &[vk::SubmitInfo::builder()
-                    .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                    .command_buffers(&[command_buffer])
-                    .wait_semaphores(&[self.image_available_semaphores[self.current_frame]])
-                    .signal_semaphores(&[self.render_finished_semaphores[self.current_frame]])
-                    .build()],
-                fence,
-            )?;
-
-            // Present Image
-            match self.swapchain_loader.queue_present(
-                self.present_queue,
-                &vk::PresentInfoKHR::builder()
-                    .swapchains(&[self.swapchain])
-                    .image_indices(&[image_index as u32])
-                    .wait_semaphores(&[self.render_finished_semaphores[self.current_frame]]),
-            ) {
-                Ok(is_suboptimal) if is_suboptimal == true => return self.recreate_swapchain(),
-                Ok(_is_suboptimal) => (),
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return self.recreate_swapchain(),
-                Err(error) => panic!("Failed to present queue: {}", error),
-            }
+            self.device.cmd_push_constants(
+                command_buffer,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                std::mem::size_of_val(&width_points) as u32,
+                bytes_of(&height_points),
+            );
         }
 
-        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+        // render meshes
+        let mut vertex_base = 0;
+        let mut index_base = 0;
+        for egui::ClippedPrimitive { clip_rect, primitive } in clipped_meshes {
+            let mesh = match primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh,
+                egui::epaint::Primitive::Callback(_) => todo!(),
+            };
+            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                continue;
+            }
 
-        Ok(())
+            unsafe {
+                if let egui::TextureId::User(id) = mesh.texture_id {
+                    if let Some(descriptor_set) = self.user_textures[id as usize] {
+                        self.device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.pipeline_layout,
+                            0,
+                            &[descriptor_set],
+                            &[],
+                        );
+                    } else {
+                        eprintln!(
+                            "This UserTexture has already been unregistered: {:?}",
+                            mesh.texture_id
+                        );
+                        continue;
+                    }
+                } else {
+                    self.device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipeline_layout,
+                        0,
+                        &[*self.texture_desc_sets.get(&mesh.texture_id).unwrap()],
+                        &[],
+                    );
+                }
+            }
+            let v_slice = &mesh.vertices;
+            let v_size = std::mem::size_of_val(&v_slice[0]);
+            let v_copy_size = v_slice.len() * v_size;
+
+            let i_slice = &mesh.indices;
+            let i_size = std::mem::size_of_val(&i_slice[0]);
+            let i_copy_size = i_slice.len() * i_size;
+
+            let vertex_buffer_ptr_next = unsafe { vertex_buffer_ptr.add(v_copy_size) };
+            let index_buffer_ptr_next = unsafe { index_buffer_ptr.add(i_copy_size) };
+
+            if vertex_buffer_ptr_next >= vertex_buffer_ptr_end
+                || index_buffer_ptr_next >= index_buffer_ptr_end
+            {
+                panic!("egui paint out of memory");
+            }
+
+            // map memory
+            unsafe { vertex_buffer_ptr.copy_from(v_slice.as_ptr() as *const u8, v_copy_size) };
+            unsafe { index_buffer_ptr.copy_from(i_slice.as_ptr() as *const u8, i_copy_size) };
+
+            vertex_buffer_ptr = vertex_buffer_ptr_next;
+            index_buffer_ptr = index_buffer_ptr_next;
+
+            // record draw commands
+            unsafe {
+                let min = clip_rect.min;
+                let min = egui::Pos2 {
+                    x: min.x * self.scale_factor as f32,
+                    y: min.y * self.scale_factor as f32,
+                };
+                let min = egui::Pos2 {
+                    x: f32::clamp(min.x, 0.0, self.physical_width as f32),
+                    y: f32::clamp(min.y, 0.0, self.physical_height as f32),
+                };
+                let max = clip_rect.max;
+                let max = egui::Pos2 {
+                    x: max.x * self.scale_factor as f32,
+                    y: max.y * self.scale_factor as f32,
+                };
+                let max = egui::Pos2 {
+                    x: f32::clamp(max.x, min.x, self.physical_width as f32),
+                    y: f32::clamp(max.y, min.y, self.physical_height as f32),
+                };
+                self.device.cmd_set_scissor(
+                    command_buffer,
+                    0,
+                    &[vk::Rect2D::builder()
+                        .offset(
+                            vk::Offset2D::builder()
+                                .x(min.x.round() as i32)
+                                .y(min.y.round() as i32)
+                                .build(),
+                        )
+                        .extent(
+                            vk::Extent2D::builder()
+                                .width((max.x.round() - min.x) as u32)
+                                .height((max.y.round() - min.y) as u32)
+                                .build(),
+                        )
+                        .build()],
+                );
+                self.device.cmd_draw_indexed(
+                    command_buffer,
+                    mesh.indices.len() as u32,
+                    1,
+                    index_base,
+                    vertex_base,
+                    0,
+                );
+            }
+
+            vertex_base += mesh.vertices.len() as i32;
+            index_base += mesh.indices.len() as u32;
+        }
+
+        for &id in &textures_delta.free {
+            self.texture_desc_sets.remove_entry(&id); // dsc_set is destroyed with dsc_pool
+            self.texture_image_infos.remove_entry(&id);
+            if let Some((_, image)) = self.texture_images.remove_entry(&id) {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                }
+            }
+            if let Some((_, image_view)) = self.texture_image_views.remove_entry(&id) {
+                unsafe {
+                    self.device.destroy_image_view(image_view, None);
+                }
+            }
+            if let Some((_, allocation)) = self.texture_allocations.remove_entry(&id) {
+                self.allocator.free(allocation).unwrap();
+            }
+        }
     }
 
-    fn recreate_swapchain(&mut self) -> Result<()> {
-        let size = self.window.inner_size();
-        self.width = size.width;
-        self.height = size.height;
-
-        // skip recreation if size is 0
-        if self.width == 0 || self.height == 0 {
-            return Ok(());
-        }
-
-        // Wait idle
-        unsafe {
-            self.device.device_wait_idle()?;
-        }
-
-        // Cleanup
-        unsafe {
-            for &framebuffer in self.framebuffers.iter() {
-                self.device.destroy_framebuffer(framebuffer, None);
+    fn update_texture(&mut self, texture_id: TextureId, delta: ImageDelta) {
+        // Extract pixel data from egui
+        let data: Vec<u8> = match &delta.image {
+            egui::ImageData::Color(image) => {
+                assert_eq!(
+                    image.width() * image.height(),
+                    image.pixels.len(),
+                    "Mismatch between texture size and texel count"
+                );
+                image.pixels.iter().flat_map(|color| color.to_array()).collect()
             }
-            self.device.destroy_render_pass(self.render_pass, None);
-            for &image_view in self.color_image_views.iter() {
-                self.device.destroy_image_view(image_view, None);
-            }
-            for &depth_view in self.depth_image_views.iter() {
-                self.device.destroy_image_view(depth_view, None);
-            }
-            for (image, allocation) in self
-                .depth_images
-                .drain(0..)
-                .zip(self.depth_image_allocations.drain(0..))
-            {
-                self.allocator.lock().unwrap().free(allocation)?;
-                self.device.destroy_image(image, None);
-            }
-        }
-
-        // Recreate swapchain
-        {
-            let old_swapchain = self.swapchain;
-
-            let capabilities = unsafe {
-                self.surface_loader
-                    .get_physical_device_surface_capabilities(self.physical_device, self.surface)?
-            };
-            let formats = unsafe {
-                self.surface_loader
-                    .get_physical_device_surface_formats(self.physical_device, self.surface)?
-            };
-            let present_modes = unsafe {
-                self.surface_loader
-                    .get_physical_device_surface_present_modes(self.physical_device, self.surface)?
-            };
-
-            self.format = formats
-                .iter()
-                .find(|f| {
-                    f.format == vk::Format::B8G8R8A8_UNORM || f.format == vk::Format::R8G8B8A8_UNORM
-                })
-                .unwrap_or(&formats[0])
-                .clone();
-            let present_mode = present_modes
-                .into_iter()
-                .find(|&p| p == vk::PresentModeKHR::MAILBOX)
-                .unwrap_or(vk::PresentModeKHR::FIFO);
-            self.extent = {
-                if capabilities.current_extent.width != u32::max_value() {
-                    capabilities.current_extent
-                } else {
-                    vk::Extent2D {
-                        width: self
-                            .width
-                            .max(capabilities.min_image_extent.width)
-                            .min(capabilities.max_image_extent.width),
-                        height: self
-                            .height
-                            .max(capabilities.min_image_extent.height)
-                            .min(capabilities.max_image_extent.height),
-                    }
-                }
-            };
-
-            let image_count = capabilities.min_image_count + 1;
-            let image_count = if capabilities.max_image_count != 0 {
-                image_count.min(capabilities.max_image_count)
-            } else {
-                image_count
-            };
-
-            let (image_sharing_mode, queue_family_indices) =
-                if self.graphics_queue_index != self.present_queue_index {
-                    (
-                        vk::SharingMode::EXCLUSIVE,
-                        vec![self.graphics_queue_index, self.present_queue_index],
-                    )
-                } else {
-                    (vk::SharingMode::EXCLUSIVE, vec![])
-                };
-
-            let swapchain_create_info = vk::SwapchainCreateInfoKHR::builder()
-                .surface(self.surface)
-                .min_image_count(image_count)
-                .image_format(self.format.format)
-                .image_color_space(self.format.color_space)
-                .image_extent(self.extent)
-                .image_array_layers(1)
-                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                .image_sharing_mode(image_sharing_mode)
-                .queue_family_indices(queue_family_indices.as_slice())
-                .pre_transform(capabilities.current_transform)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                .present_mode(present_mode)
-                .clipped(true)
-                .old_swapchain(old_swapchain);
-
-            self.swapchain = unsafe {
-                self.swapchain_loader
-                    .create_swapchain(&swapchain_create_info, None)?
-            };
-
-            // destroy old swapchain
-            unsafe {
-                self.swapchain_loader.destroy_swapchain(old_swapchain, None);
+            egui::ImageData::Font(image) => {
+                image.srgba_pixels(None).flat_map(|color| color.to_array()).collect()
             }
         };
-        self.swapchain_images =
-            unsafe { self.swapchain_loader.get_swapchain_images(self.swapchain)? };
+        let cmd_pool = {
+            let cmd_pool_info = vk::CommandPoolCreateInfo::builder()
+                .queue_family_index(self.qfi)
+                .build();
+            unsafe {
+                self.device.create_command_pool(&cmd_pool_info, None).unwrap()
+            }
+        };
+        let cmd_buff = {
+            let cmd_buff_alloc_info = vk::CommandBufferAllocateInfo::builder()
+                .command_buffer_count(1u32)
+                .command_pool(cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .build();
+            unsafe {
+                self.device.allocate_command_buffers(&cmd_buff_alloc_info).unwrap()[0]
+            }
+        };
+        let fence_info = vk::FenceCreateInfo::builder()
+            .build();
+        let cmd_buff_fence = unsafe { self.device.create_fence(&fence_info, None).unwrap() };
 
-        // Recreate render pass
-        self.render_pass = {
-            // Attachments
-            let attachments = [
-                vk::AttachmentDescription::builder()
-                    .format(self.format.format)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        let (staging_buffer, staging_allocation) = {
+            let buffer_size = data.len() as vk::DeviceSize;
+            let buffer_info = vk::BufferCreateInfo::builder()
+                .size(buffer_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC);
+            let texture_buffer = unsafe { self.device.create_buffer(&buffer_info, None) }.unwrap();
+            let requirements = unsafe { self.device.get_buffer_memory_requirements(texture_buffer) };
+            let allocation = self.allocator.allocate(A::AllocationCreateInfo::new(
+                requirements,
+                MemoryLocation::CpuToGpu,
+                true
+            )).unwrap();
+            unsafe { self.device.bind_buffer_memory(texture_buffer, allocation.memory(), allocation.offset()).unwrap() };
+            (texture_buffer, allocation)
+        };
+        let ptr = staging_allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+        unsafe {
+            ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        }
+        let (texture_image, info, texture_allocation) = {
+            let extent = vk::Extent3D {
+                width: delta.image.width() as u32,
+                height: delta.image.height() as u32,
+                depth:1
+            };
+            let create_info = vk::ImageCreateInfo::builder()
+                .array_layers(1)
+                .extent(extent)
+                .flags(vk::ImageCreateFlags::empty())
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .image_type(vk::ImageType::TYPE_2D)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .mip_levels(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                .build();
+            let handle = unsafe { self.device.create_image(&create_info, None) }.unwrap();
+            let requirements = unsafe { self.device.get_image_memory_requirements(handle) };
+            let allocation = self.allocator.allocate(A::AllocationCreateInfo::new(
+                requirements,
+                MemoryLocation::GpuOnly,
+                false
+            )).unwrap();
+            unsafe { self.device.bind_image_memory(handle, allocation.memory(), allocation.offset()).unwrap() };
+            (handle, create_info, allocation)
+        };
+        self.texture_image_infos.insert(texture_id, info);
+        let texture_image_view = {
+            let create_info = vk::ImageViewCreateInfo::builder()
+                .components(vk::ComponentMapping::default())
+                .flags(vk::ImageViewCreateFlags::empty())
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .image(texture_image)
+                .subresource_range(vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_array_layer(0)
+                    .base_mip_level(0)
+                    .layer_count(1)
+                    .level_count(1)
+                    .build())
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .build();
+            unsafe { self.device.create_image_view(&create_info, None).unwrap() }
+        };
+        // begin cmd buff
+        unsafe {
+            let cmd_buff_begin_info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+                .build();
+            self.device.begin_command_buffer(cmd_buff, &cmd_buff_begin_info).unwrap();
+        }
+        // Transition texture image for transfer dst
+        insert_image_memory_barrier(&self.device, &cmd_buff,
+                                    &texture_image,
+                                    vk::QUEUE_FAMILY_IGNORED,
+                                    vk::QUEUE_FAMILY_IGNORED,
+                                    vk::AccessFlags::NONE_KHR,
+                                    vk::AccessFlags::TRANSFER_WRITE,
+                                    vk::ImageLayout::UNDEFINED,
+                                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                    vk::PipelineStageFlags::HOST,
+                                    vk::PipelineStageFlags::TRANSFER,
+                                    vk::ImageSubresourceRange::builder()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .base_array_layer(0u32)
+                                        .layer_count(1u32)
+                                        .base_mip_level(0u32)
+                                        .level_count(1u32)
+                                        .build());
+        let region = vk::BufferImageCopy::builder()
+            .buffer_offset(0)
+            .buffer_row_length(delta.image.width() as u32)
+            .buffer_image_height(delta.image.height() as u32)
+            .image_subresource(vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .mip_level(0)
+                .build())
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0})
+            .image_extent(vk::Extent3D { width: delta.image.width() as u32, height: delta.image.height() as u32, depth: 1})
+            .build();
+        unsafe { self.device.cmd_copy_buffer_to_image(cmd_buff, staging_buffer, texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]); }
+        insert_image_memory_barrier(&self.device, &cmd_buff,
+                                    &texture_image,
+                                    vk::QUEUE_FAMILY_IGNORED,
+                                    vk::QUEUE_FAMILY_IGNORED,
+                                    vk::AccessFlags::TRANSFER_WRITE,
+                                    vk::AccessFlags::SHADER_READ,
+                                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                    vk::PipelineStageFlags::TRANSFER,
+                                    vk::PipelineStageFlags::VERTEX_SHADER,
+                                    vk::ImageSubresourceRange::builder()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .base_array_layer(0u32)
+                                        .layer_count(1u32)
+                                        .base_mip_level(0u32)
+                                        .level_count(1u32)
+                                        .build());
+
+        unsafe {
+            self.device.end_command_buffer(cmd_buff).unwrap();
+        }
+        let cmd_buffs = [cmd_buff];
+        let submit_infos = [
+            vk::SubmitInfo::builder()
+                .command_buffers(&cmd_buffs)
+                .build()
+        ];
+        unsafe {
+            self.device.queue_submit(self.queue, &submit_infos, cmd_buff_fence).unwrap();
+            self.device.wait_for_fences(&[cmd_buff_fence], true, u64::MAX).unwrap();
+        }
+
+        // texture is now in GPU memory, now we need to decide whether we should register it as new or update existing
+
+        if let Some(pos) = delta.pos { // Blit texture data to existing texture if delta pos exists (e.g. font changed)
+            let existing_texture = self.texture_images.get(&texture_id);
+            if let Some(existing_texture) = existing_texture {
+                let info = self.texture_image_infos.get(&texture_id).unwrap();
+                unsafe {
+                    self.device.reset_command_pool(cmd_pool, vk::CommandPoolResetFlags::empty()).unwrap();
+                    self.device.reset_fences(&[cmd_buff_fence]).unwrap();
+                    // begin cmd buff
+                    let cmd_buff_begin_info = vk::CommandBufferBeginInfo::builder()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+                        .build();
+                    self.device.begin_command_buffer(cmd_buff, &cmd_buff_begin_info).unwrap();
+
+                    // Transition existing image for transfer dst
+                    insert_image_memory_barrier(&self.device, &cmd_buff,
+                                                &existing_texture,
+                                                vk::QUEUE_FAMILY_IGNORED,
+                                                vk::QUEUE_FAMILY_IGNORED,
+                                                vk::AccessFlags::SHADER_READ,
+                                                vk::AccessFlags::TRANSFER_WRITE,
+                                                vk::ImageLayout::UNDEFINED,
+                                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                                                vk::PipelineStageFlags::TRANSFER,
+                                                vk::ImageSubresourceRange::builder()
+                                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                                    .base_array_layer(0u32)
+                                                    .layer_count(1u32)
+                                                    .base_mip_level(0u32)
+                                                    .level_count(1u32)
+                                                    .build());
+                    // Transition new image for transfer src
+                    insert_image_memory_barrier(&self.device, &cmd_buff,
+                                                &texture_image,
+                                                vk::QUEUE_FAMILY_IGNORED,
+                                                vk::QUEUE_FAMILY_IGNORED,
+                                                vk::AccessFlags::SHADER_READ,
+                                                vk::AccessFlags::TRANSFER_READ,
+                                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                                                vk::PipelineStageFlags::TRANSFER,
+                                                vk::ImageSubresourceRange::builder()
+                                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                                    .base_array_layer(0u32)
+                                                    .layer_count(1u32)
+                                                    .base_mip_level(0u32)
+                                                    .level_count(1u32)
+                                                    .build());
+                    let top_left = vk::Offset3D { x: pos[0] as i32, y: pos[1] as i32, z: 0 };
+                    let bottom_right = vk::Offset3D { x: pos[0] as i32 + delta.image.width() as i32, y: pos[1] as i32 + delta.image.height() as i32, z: 1 };
+
+                    let region = vk::ImageBlit {
+                        src_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                        src_offsets: [vk::Offset3D{ x: 0, y: 0, z: 0 }, vk::Offset3D{ x: info.extent.width as i32, y: info.extent.height as i32, z: info.extent.depth as i32 }],
+                        dst_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                        dst_offsets: [top_left, bottom_right]
+                    };
+                    self.device.cmd_blit_image(cmd_buff, texture_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, *existing_texture, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region], vk::Filter::NEAREST);
+
+                    // Transition existing image for shader read
+                    insert_image_memory_barrier(&self.device, &cmd_buff,
+                                                &existing_texture,
+                                                vk::QUEUE_FAMILY_IGNORED,
+                                                vk::QUEUE_FAMILY_IGNORED,
+                                                vk::AccessFlags::TRANSFER_WRITE,
+                                                vk::AccessFlags::SHADER_READ,
+                                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                                vk::PipelineStageFlags::TRANSFER,
+                                                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                                                vk::ImageSubresourceRange::builder()
+                                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                                    .base_array_layer(0u32)
+                                                    .layer_count(1u32)
+                                                    .base_mip_level(0u32)
+                                                    .level_count(1u32)
+                                                    .build());
+                    self.device.end_command_buffer(cmd_buff).unwrap();
+                    let cmd_buffs = [cmd_buff];
+                    let submit_infos = [
+                        vk::SubmitInfo::builder()
+                            .command_buffers(&cmd_buffs)
+                            .build()
+                    ];
+                    self.device.queue_submit(self.queue, &submit_infos, cmd_buff_fence).unwrap();
+                    self.device.wait_for_fences(&[cmd_buff_fence], true, u64::MAX).unwrap();
+
+                    // destroy texture_image and view
+                    self.device.destroy_image(texture_image, None);
+                    self.device.destroy_image_view(texture_image_view, None);
+                    self.allocator.free(texture_allocation).unwrap();
+                }
+            } else {
+                return;
+            }
+        } else { // Otherwise save the newly created texture
+
+            // update dsc set
+            let dsc_set = {
+                let dsc_alloc_info = vk::DescriptorSetAllocateInfo::builder()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&[self.descriptor_set_layouts[0]])
+                    .build();
+                unsafe {
+                    self.device.allocate_descriptor_sets(&dsc_alloc_info).unwrap()[0]
+                }
+            };
+            let image_info = vk::DescriptorImageInfo::builder()
+                .image_view(texture_image_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .sampler(self.sampler)
+                .build();
+            let dsc_writes = [
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(dsc_set)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .dst_array_element(0_u32)
+                    .dst_binding(0_u32)
+                    .image_info(&[image_info])
+                    .build()
+            ];
+            unsafe {
+                self.device.update_descriptor_sets(&dsc_writes, &[]);
+            }
+            // register new texture
+            self.texture_images.insert(texture_id, texture_image);
+            self.texture_allocations.insert(texture_id, texture_allocation);
+            self.texture_image_views.insert(texture_id, texture_image_view);
+            self.texture_desc_sets.insert(texture_id, dsc_set);
+        }
+        // cleanup
+        unsafe {
+            self.device.destroy_buffer(staging_buffer, None);
+            self.allocator.free(staging_allocation).unwrap();
+            self.device.destroy_command_pool(cmd_pool, None);
+            self.device.destroy_fence(cmd_buff_fence, None);
+        }
+    }
+
+    /// Update swapchain.
+    pub fn update_swapchain(
+        &mut self,
+        physical_width: u32,
+        physical_height: u32,
+        swapchain: vk::SwapchainKHR,
+        surface_format: vk::SurfaceFormatKHR,
+    ) {
+        self.physical_width = physical_width;
+        self.physical_height = physical_height;
+
+        // release vk objects to be regenerated.
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+        }
+
+        // swap images
+        let swap_images = unsafe { self.swapchain_loader.get_swapchain_images(swapchain) }
+            .expect("Failed to get swapchain images.");
+
+        // Recreate pipeline for update render pass
+        self.pipeline = {
+            let bindings = [vk::VertexInputBindingDescription::builder()
+                .binding(0)
+                .input_rate(vk::VertexInputRate::VERTEX)
+                .stride(5 * std::mem::size_of::<f32>() as u32)
+                .build()];
+            let attributes = [
+                // position
+                vk::VertexInputAttributeDescription::builder()
+                    .binding(0)
+                    .offset(0)
+                    .location(0)
+                    .format(vk::Format::R32G32_SFLOAT)
                     .build(),
-                vk::AttachmentDescription::builder()
-                    .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                // uv
+                vk::VertexInputAttributeDescription::builder()
+                    .binding(0)
+                    .offset(8)
+                    .location(1)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .build(),
+                // color
+                vk::VertexInputAttributeDescription::builder()
+                    .binding(0)
+                    .offset(16)
+                    .location(2)
+                    .format(vk::Format::R8G8B8A8_UNORM)
                     .build(),
             ];
-            // color reference
-            let color_reference = [vk::AttachmentReference::builder()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+
+            let vertex_shader_module = {
+                let bytes_code = include_bytes!("shaders/spv/vert.spv");
+                let shader_module_create_info = vk::ShaderModuleCreateInfo {
+                    code_size: bytes_code.len(),
+                    p_code: bytes_code.as_ptr() as *const u32,
+                    ..Default::default()
+                };
+                unsafe {
+                    self.device
+                        .create_shader_module(&shader_module_create_info, None)
+                }
+                    .expect("Failed to create vertex shader module.")
+            };
+            let fragment_shader_module = {
+                let bytes_code = include_bytes!("shaders/spv/frag.spv");
+                let shader_module_create_info = vk::ShaderModuleCreateInfo {
+                    code_size: bytes_code.len(),
+                    p_code: bytes_code.as_ptr() as *const u32,
+                    ..Default::default()
+                };
+                unsafe {
+                    self.device
+                        .create_shader_module(&shader_module_create_info, None)
+                }
+                    .expect("Failed to create fragment shader module.")
+            };
+            let main_function_name = CString::new("main").unwrap();
+            let pipeline_shader_stages = [
+                vk::PipelineShaderStageCreateInfo::builder()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vertex_shader_module)
+                    .name(&main_function_name)
+                    .build(),
+                vk::PipelineShaderStageCreateInfo::builder()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(fragment_shader_module)
+                    .name(&main_function_name)
+                    .build(),
+            ];
+
+            let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
+                .viewport_count(1)
+                .scissor_count(1);
+            let rasterization_info = vk::PipelineRasterizationStateCreateInfo::builder()
+                .depth_clamp_enable(false)
+                .rasterizer_discard_enable(false)
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .depth_bias_enable(false)
+                .line_width(1.0);
+            let stencil_op = vk::StencilOpState::builder()
+                .fail_op(vk::StencilOp::KEEP)
+                .pass_op(vk::StencilOp::KEEP)
+                .compare_op(vk::CompareOp::ALWAYS)
+                .build();
+            let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+                .depth_bounds_test_enable(false)
+                .stencil_test_enable(false)
+                .front(stencil_op)
+                .back(stencil_op);
+            let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
+                .color_write_mask(
+                    vk::ColorComponentFlags::R
+                        | vk::ColorComponentFlags::G
+                        | vk::ColorComponentFlags::B
+                        | vk::ColorComponentFlags::A,
+                )
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .build()];
-            // depth reference
-            let depth_reference = vk::AttachmentReference::builder()
-                .attachment(1)
-                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-            // subpass descriptionを作成
-            let subpasses = [vk::SubpassDescription::builder()
-                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(&color_reference)
-                .depth_stencil_attachment(&depth_reference)
+            let color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
+                .attachments(&color_blend_attachments);
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic_state_info =
+                vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
+            let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
+                .vertex_attribute_descriptions(&attributes)
+                .vertex_binding_descriptions(&bindings);
+            let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+            let pipeline_create_info = [vk::GraphicsPipelineCreateInfo::builder()
+                .stages(&pipeline_shader_stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_info)
+                .viewport_state(&viewport_info)
+                .rasterization_state(&rasterization_info)
+                .multisample_state(&multisample_info)
+                .depth_stencil_state(&depth_stencil_info)
+                .color_blend_state(&color_blend_info)
+                .dynamic_state(&dynamic_state_info)
+                .layout(self.pipeline_layout)
                 .build()];
-            // render passの作成
-            let render_pass_create_info = vk::RenderPassCreateInfo::builder()
-                .attachments(&attachments)
-                .subpasses(&subpasses);
+
+            let pipeline = unsafe {
+                self.device.create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &pipeline_create_info,
+                    None,
+                )
+            }
+                .expect("Failed to create graphics pipeline")[0];
             unsafe {
                 self.device
-                    .create_render_pass(&render_pass_create_info, None)?
+                    .destroy_shader_module(vertex_shader_module, None);
+                self.device
+                    .destroy_shader_module(fragment_shader_module, None);
             }
+            pipeline
+        };
+    }
+
+    /// Registering user texture.
+    ///
+    /// Pass the Vulkan ImageView and Sampler.
+    /// `image_view`'s image layout must be `SHADER_READ_ONLY_OPTIMAL`.
+    ///
+    /// UserTexture needs to be unregistered when it is no longer needed.
+    ///
+    /// # Example
+    /// ```sh
+    /// cargo run --example user_texture
+    /// ```
+    /// [The example for user texture is in examples directory](https://github.com/MatchaChoco010/egui_winit_ash_vk_mem/tree/main/examples/user_texture)
+    pub fn register_user_texture(
+        &mut self,
+        image_view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) -> egui::TextureId {
+        // get texture id
+        let mut id = None;
+        for (i, user_texture) in self.user_textures.iter().enumerate() {
+            if user_texture.is_none() {
+                id = Some(i as u64);
+                break;
+            }
+        }
+        let id = if let Some(i) = id {
+            i
+        } else {
+            self.user_textures.len() as u64
         };
 
-        // Recreate framebuffer
-        {
-            let mut framebuffers = vec![];
-            let mut depth_images = vec![];
-            let mut depth_image_allocations = vec![];
-            let mut color_image_views = vec![];
-            let mut depth_image_views = vec![];
-
-            for &image in self.swapchain_images.iter() {
-                let mut attachments = vec![];
-
-                let color_attachment = unsafe {
-                    self.device.create_image_view(
-                        &vk::ImageViewCreateInfo::builder()
-                            .image(image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(self.format.format)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::builder()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1)
-                                    .build(),
-                            ),
-                        None,
-                    )?
-                };
-                attachments.push(color_attachment);
-                color_image_views.push(color_attachment);
-
-                let depth_image_create_info = vk::ImageCreateInfo::builder()
-                    .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D {
-                        width: self.extent.width,
-                        height: self.extent.height,
-                        depth: 1,
-                    });
-                let depth_image =
-                    unsafe { self.device.create_image(&depth_image_create_info, None)? };
-                let depth_image_requirements =
-                    unsafe { self.device.get_image_memory_requirements(depth_image) };
-                let depth_image_allocation =
-                    self.allocator
-                        .lock()
-                        .unwrap()
-                        .allocate(&AllocationCreateDesc {
-                            name: "depth image",
-                            requirements: depth_image_requirements,
-                            location: gpu_allocator::MemoryLocation::GpuOnly,
-                            linear: false,
-                        })?;
-                unsafe {
-                    self.device.bind_image_memory(
-                        depth_image,
-                        depth_image_allocation.memory(),
-                        depth_image_allocation.offset(),
-                    )?;
-                }
-                depth_images.push(depth_image);
-                depth_image_allocations.push(depth_image_allocation);
-                let depth_attachment = unsafe {
-                    self.device.create_image_view(
-                        &vk::ImageViewCreateInfo::builder()
-                            .image(depth_image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::D32_SFLOAT)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::builder()
-                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1)
-                                    .build(),
-                            ),
-                        None,
-                    )?
-                };
-                attachments.push(depth_attachment);
-                depth_image_views.push(depth_attachment);
-                framebuffers.push(unsafe {
-                    self.device.create_framebuffer(
-                        &vk::FramebufferCreateInfo::builder()
-                            .render_pass(self.render_pass)
-                            .attachments(attachments.as_slice())
-                            .width(self.extent.width)
-                            .height(self.extent.height)
-                            .layers(1),
-                        None,
-                    )?
-                });
-            }
-
-            self.framebuffers = framebuffers;
-            self.depth_images = depth_images;
-            self.depth_image_allocations = depth_image_allocations;
-            self.color_image_views = color_image_views;
-            self.depth_image_views = depth_image_views;
+        // allocate and update descriptor set
+        let layouts = [self.user_texture_layout];
+        let descriptor_set = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::builder()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&layouts),
+            )
         }
-
-        // #### egui ##########################################################################
-        self.egui_integration.update_swapchain(
-            self.width,
-            self.height,
-            self.swapchain.clone(),
-            self.format.clone(),
-        );
-        // #### egui ##########################################################################
-
-        Ok(())
-    }
-}
-impl Drop for App {
-    fn drop(&mut self) {
+            .expect("Failed to create descriptor sets.")[0];
         unsafe {
-            self.device.queue_wait_idle(self.graphics_queue).unwrap();
-            self.device.queue_wait_idle(self.present_queue).unwrap();
+            self.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::builder()
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .dst_set(descriptor_set)
+                    .image_info(&[vk::DescriptorImageInfo::builder()
+                        .image_view(image_view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .sampler(sampler)
+                        .build()])
+                    .dst_binding(0)
+                    .build()],
+                &[],
+            );
+        }
 
-            self.egui_integration.destroy();
-            ManuallyDrop::drop(&mut self.egui_integration);
+        if id == self.user_textures.len() as u64 {
+            self.user_textures.push(Some(descriptor_set));
+        } else {
+            self.user_textures[id as usize] = Some(descriptor_set);
+        }
 
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.device
-                    .destroy_semaphore(self.image_available_semaphores[i], None);
-                self.device
-                    .destroy_semaphore(self.render_finished_semaphores[i], None);
-                self.device.destroy_fence(self.fences[i], None);
-            }
-            self.device.destroy_buffer(self.vertex_buffer, None);
-            if let Some(allocation) = self.vertex_buffer_allocation.take() {
-                self.allocator.lock().unwrap().free(allocation).unwrap();
-            }
-            self.device.destroy_pipeline(self.graphics_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            for &color_image_view in self.color_image_views.iter() {
-                self.device.destroy_image_view(color_image_view, None);
-            }
-            for &depth_image_view in self.depth_image_views.iter() {
-                self.device.destroy_image_view(depth_image_view, None);
-            }
-            for &framebuffer in self.framebuffers.iter() {
-                self.device.destroy_framebuffer(framebuffer, None);
-            }
-            for (image, allocation) in self
-                .depth_images
-                .drain(0..)
-                .zip(self.depth_image_allocations.drain(0..))
-            {
-                self.device.destroy_image(image, None);
-                self.allocator.lock().unwrap().free(allocation).unwrap();
-            }
-            self.device.destroy_render_pass(self.render_pass, None);
-            for (buffer, allocation) in self
-                .uniform_buffers
-                .drain(0..)
-                .zip(self.uniform_buffer_allocations.drain(0..))
-            {
-                self.device.destroy_buffer(buffer, None);
-                self.allocator.lock().unwrap().free(allocation).unwrap();
-            }
-            for &layout in self.descriptor_set_layouts.iter() {
-                self.device.destroy_descriptor_set_layout(layout, None);
-            }
-            self.device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
-            self.device
-                .destroy_command_pool(self.graphics_command_pool, None);
+        egui::TextureId::User(id)
+    }
 
-            ManuallyDrop::drop(&mut self.allocator);
-
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.device.destroy_device(None);
-            #[cfg(debug_assertions)]
-            self.debug_utils_loader
-                .destroy_debug_utils_messenger(self.debug_callback, None);
-            self.instance.destroy_instance(None);
+    /// Unregister user texture.
+    ///
+    /// The internal texture (egui::TextureId::Egui) cannot be unregistered.
+    pub fn unregister_user_texture(&mut self, texture_id: egui::TextureId) {
+        if let egui::TextureId::User(id) = texture_id {
+            if let Some(descriptor_set) = self.user_textures[id as usize] {
+                unsafe {
+                    self.device
+                        .free_descriptor_sets(self.descriptor_pool, &[descriptor_set])
+                        .expect("Failed to free descriptor sets.");
+                }
+                self.user_textures[id as usize] = None;
+            }
+        } else {
+            eprintln!("The internal texture cannot be unregistered; please pass the texture ID of UserTexture.");
+            return;
         }
     }
-}
 
-fn main() -> Result<()> {
-    let event_loop = EventLoop::new();
-    let mut app = App::new(&event_loop)?;
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-        
-        match event {
-            Event::WindowEvent { event, window_id: _ } => {
-                // Update Egui integration so the UI works!
-                let _response = app.egui_integration.handle_event(&event);
+    /// destroy vk objects.
+    ///
+    /// # Unsafe
+    /// This method release vk objects memory that is not managed by Rust.
+    pub unsafe fn destroy(&mut self) {
+        self.device
+            .destroy_descriptor_set_layout(self.user_texture_layout, None);
 
-                match event {
-                    WindowEvent::Resized(_) => {
-                        app.recreate_swapchain().unwrap();
-                    }
-                    WindowEvent::ScaleFactorChanged { .. } => {
-                        app.recreate_swapchain().unwrap();
-                    }
-                    WindowEvent::CloseRequested => {
-                        *control_flow = ControlFlow::Exit;
-                    }
-                    _ => (),
-                }
-            },
-            Event::MainEventsCleared => app.window.request_redraw(),
-            Event::RedrawRequested(_window_id) => app.draw().unwrap(),
-            _ => (),
+        for (buffer, allocation) in self
+            .index_buffers
+            .drain(0..)
+            .zip(self.index_buffer_allocations.drain(0..))
+        {
+            self.device.destroy_buffer(buffer, None);
+            self.allocator
+                .free(allocation)
+                .expect("Failed to free allocation");
         }
-    })
+        for (buffer, allocation) in self
+            .vertex_buffers
+            .drain(0..)
+            .zip(self.vertex_buffer_allocations.drain(0..))
+        {
+            self.device.destroy_buffer(buffer, None);
+            self.allocator
+                .free(allocation)
+                .expect("Failed to free allocation");
+        }
+        self.device.destroy_sampler(self.sampler, None);
+        self.device.destroy_pipeline(self.pipeline, None);
+        self.device
+            .destroy_pipeline_layout(self.pipeline_layout, None);
+        for &descriptor_set_layout in self.descriptor_set_layouts.iter() {
+            self.device
+                .destroy_descriptor_set_layout(descriptor_set_layout, None);
+        }
+        self.device
+            .destroy_descriptor_pool(self.descriptor_pool, None);
+
+        for (_texture_id, texture_image) in self.texture_images.drain() {
+            self.device.destroy_image(texture_image, None);
+        }
+        for (_texture_id, texture_image_view) in self.texture_image_views.drain() {
+            self.device.destroy_image_view(texture_image_view, None);
+        }
+        for (_texture_id, texture_allocation) in self.texture_allocations.drain() {
+            self.allocator.free(texture_allocation).unwrap();
+        }
+    }
 }

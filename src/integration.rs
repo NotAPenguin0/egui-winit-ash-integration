@@ -239,8 +239,8 @@ impl<A: AllocatorTrait> Integration<A> {
                 .blend_enable(true)
                 .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
                 .build()];
             let color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
                 .attachments(&color_blend_attachments);

@@ -237,10 +237,10 @@ impl<A: AllocatorTrait> Integration<A> {
                         | vk::ColorComponentFlags::A,
                 )
                 .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
                 .build()];
             let color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
                 .attachments(&color_blend_attachments);
@@ -1016,163 +1016,10 @@ impl<A: AllocatorTrait> Integration<A> {
         self.physical_width = physical_width;
         self.physical_height = physical_height;
 
-        // release vk objects to be regenerated.
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-        }
-
         // swap images
-        let swap_images = unsafe { self.swapchain_loader.get_swapchain_images(swapchain) }
+        self.swap_images = unsafe { self.swapchain_loader.get_swapchain_images(swapchain) }
             .expect("Failed to get swapchain images.");
-
-        // Recreate pipeline for update render pass
-        self.pipeline = {
-            let bindings = [vk::VertexInputBindingDescription::builder()
-                .binding(0)
-                .input_rate(vk::VertexInputRate::VERTEX)
-                .stride(5 * std::mem::size_of::<f32>() as u32)
-                .build()];
-            let attributes = [
-                // position
-                vk::VertexInputAttributeDescription::builder()
-                    .binding(0)
-                    .offset(0)
-                    .location(0)
-                    .format(vk::Format::R32G32_SFLOAT)
-                    .build(),
-                // uv
-                vk::VertexInputAttributeDescription::builder()
-                    .binding(0)
-                    .offset(8)
-                    .location(1)
-                    .format(vk::Format::R32G32_SFLOAT)
-                    .build(),
-                // color
-                vk::VertexInputAttributeDescription::builder()
-                    .binding(0)
-                    .offset(16)
-                    .location(2)
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .build(),
-            ];
-
-            let vertex_shader_module = {
-                let bytes_code = include_bytes!("shaders/spv/vert.spv");
-                let shader_module_create_info = vk::ShaderModuleCreateInfo {
-                    code_size: bytes_code.len(),
-                    p_code: bytes_code.as_ptr() as *const u32,
-                    ..Default::default()
-                };
-                unsafe {
-                    self.device
-                        .create_shader_module(&shader_module_create_info, None)
-                }
-                    .expect("Failed to create vertex shader module.")
-            };
-            let fragment_shader_module = {
-                let bytes_code = include_bytes!("shaders/spv/frag.spv");
-                let shader_module_create_info = vk::ShaderModuleCreateInfo {
-                    code_size: bytes_code.len(),
-                    p_code: bytes_code.as_ptr() as *const u32,
-                    ..Default::default()
-                };
-                unsafe {
-                    self.device
-                        .create_shader_module(&shader_module_create_info, None)
-                }
-                    .expect("Failed to create fragment shader module.")
-            };
-            let main_function_name = CString::new("main").unwrap();
-            let pipeline_shader_stages = [
-                vk::PipelineShaderStageCreateInfo::builder()
-                    .stage(vk::ShaderStageFlags::VERTEX)
-                    .module(vertex_shader_module)
-                    .name(&main_function_name)
-                    .build(),
-                vk::PipelineShaderStageCreateInfo::builder()
-                    .stage(vk::ShaderStageFlags::FRAGMENT)
-                    .module(fragment_shader_module)
-                    .name(&main_function_name)
-                    .build(),
-            ];
-
-            let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
-                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-            let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
-                .viewport_count(1)
-                .scissor_count(1);
-            let rasterization_info = vk::PipelineRasterizationStateCreateInfo::builder()
-                .depth_clamp_enable(false)
-                .rasterizer_discard_enable(false)
-                .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::NONE)
-                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-                .depth_bias_enable(false)
-                .line_width(1.0);
-            let stencil_op = vk::StencilOpState::builder()
-                .fail_op(vk::StencilOp::KEEP)
-                .pass_op(vk::StencilOp::KEEP)
-                .compare_op(vk::CompareOp::ALWAYS)
-                .build();
-            let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
-                .depth_test_enable(true)
-                .depth_write_enable(true)
-                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
-                .depth_bounds_test_enable(false)
-                .stencil_test_enable(false)
-                .front(stencil_op)
-                .back(stencil_op);
-            let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
-                .color_write_mask(
-                    vk::ColorComponentFlags::R
-                        | vk::ColorComponentFlags::G
-                        | vk::ColorComponentFlags::B
-                        | vk::ColorComponentFlags::A,
-                )
-                .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::ONE)
-                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .build()];
-            let color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
-                .attachments(&color_blend_attachments);
-            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-            let dynamic_state_info =
-                vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
-            let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
-                .vertex_attribute_descriptions(&attributes)
-                .vertex_binding_descriptions(&bindings);
-            let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-            let pipeline_create_info = [vk::GraphicsPipelineCreateInfo::builder()
-                .stages(&pipeline_shader_stages)
-                .vertex_input_state(&vertex_input_state)
-                .input_assembly_state(&input_assembly_info)
-                .viewport_state(&viewport_info)
-                .rasterization_state(&rasterization_info)
-                .multisample_state(&multisample_info)
-                .depth_stencil_state(&depth_stencil_info)
-                .color_blend_state(&color_blend_info)
-                .dynamic_state(&dynamic_state_info)
-                .layout(self.pipeline_layout)
-                .build()];
-
-            let pipeline = unsafe {
-                self.device.create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &pipeline_create_info,
-                    None,
-                )
-            }
-                .expect("Failed to create graphics pipeline")[0];
-            unsafe {
-                self.device
-                    .destroy_shader_module(vertex_shader_module, None);
-                self.device
-                    .destroy_shader_module(fragment_shader_module, None);
-            }
-            pipeline
-        };
+       
     }
 
     /// Registering user texture.

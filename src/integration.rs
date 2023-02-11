@@ -1015,10 +1015,6 @@ impl<A: AllocatorTrait> Integration<A> {
     ) {
         self.physical_width = physical_width;
         self.physical_height = physical_height;
-
-        // swap images
-        self.swap_images = unsafe { self.swapchain_loader.get_swapchain_images(swapchain) }
-            .expect("Failed to get swapchain images.");
        
     }
 

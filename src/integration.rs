@@ -253,7 +253,13 @@ impl<A: AllocatorTrait> Integration<A> {
             let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
+            let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::builder()
+                .view_mask(0)
+                .color_attachment_formats(std::slice::from_ref(&surface_format.format))
+                .build();
+
             let pipeline_create_info = [vk::GraphicsPipelineCreateInfo::builder()
+                .push_next(&mut pipeline_rendering_info)
                 .stages(&pipeline_shader_stages)
                 .vertex_input_state(&vertex_input_state)
                 .input_assembly_state(&input_assembly_info)

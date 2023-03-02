@@ -27,7 +27,7 @@ ash = { version="0.37.1", default-features = false, features = ["linked", "debug
 bytemuck = "1.7.3"
 copypasta = "0.8.1"
 egui = { git = "https://github.com/NotAPenguin0/egui" }
-egui-winit = "0.21.0"
+egui-winit = { git = "https://github.com/NotAPenguin0/egui" }
 gpu-allocator = { version = "0.21.0", optional = true }
 webbrowser = "0.8.4"
 winit = "0.28.1"
